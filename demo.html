@@ -8,16 +8,26 @@
     <button id="start-btn">Start DEMO</button>
 
     <div id="example-component" style="display: none;">
-        <p>Show Items: <input type="checkbox" checked zx-click="showItems = !showItems; updateUI();"/></p>
-        <ul zx-if="showItems" zx-for="let $item of items;index by $index">
+        <p>Show Items: <input type="checkbox" checked zx-click="showItems = !showItems; updateUI();" id="cb"/></p>
+        <p>IFx/FORx</p>
+        <ul zx-ifx="showItems" zx-forx="let $item of items;index by $index" id="forx-ifx-test">
             <li>
                 <input type="text" value="" zx-change="onTextEntered($event, $item)"/>
                 / Text: <span zx-inner-text="$item.text"></span>
                 / [<span style="cursor: pointer" zx-click="removeItem($item)">X</span>]
             </li>
         </ul>
-        <button zx-if="showItems" zx-click="addItem()">Add item</button>
+
         <br/>
+        <p>IF/FOR</p>
+        <ul id="for-if-test">
+            <li zx-if="showItems" zx-for="let $item of items;index by $index">
+                / Text: <span zx-inner-text="$item.text"></span>
+                / [<span style="cursor: pointer" zx-click="removeItem($item)">X</span>]
+            </li>
+        </ul>
+
+        <button zx-if="showItems" zx-click="addItem()">Add item</button>
         <button zx-click="updateUI()">Update UI</button>
     </div>
     <script type="module" src="demo.js"></script>

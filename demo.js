@@ -23,8 +23,8 @@ class DemoComponent {
 
     /**
      *
-     * @param {Event}  eventArgs
-     * @param item
+     * @param {{target: HTMLInputElement}} eventArgs
+     * @param item {*}
      */
     onTextEntered(eventArgs, item) {
         item.text = eventArgs.target.value;

@@ -1,12 +1,18 @@
 const $context = Symbol('bindingContext');
 
 //Expression compilation
+/**
+ * @param expr {string}
+ * @param knownVariables {string[]}
+ * @param resultTransform {function(string): string}
+ * @returns {function(*, Object.<string, *>): *}
+ */
 function generateFunctionForExpression(expr, knownVariables, resultTransform) {
     const regExpr = /(?<p>\.\s*)?(?<t>[_\w$][_\w\d$]*)(?<m>\s*\()?/g;
     const modelDeclarations = [];
     const kvDeclarations = [];
     const exprTransformed = expr.replace(regExpr, function(match, p, t, m) {
-        if (p) {
+        if (p || !m && (t === 'true' || t === 'false')) {
             return match;
         }
 
@@ -25,18 +31,26 @@ function generateFunctionForExpression(expr, knownVariables, resultTransform) {
         return `${p || ''}$$m.${t}${m || ''}`;
     });
 
-    const varsBlock = modelDeclarations.map(varName => `let ${varName} = $$m.${varName};`).join('\n');
-    const knownVarsBlock = kvDeclarations.map(varName => `let ${varName} = $$v.${varName};`).join('\n');
+    //const varsBlock = modelDeclarations.map(varName => `let ${varName} = $$m.${varName};`).join('\n');
+    //const knownVarsBlock = kvDeclarations.map(varName => `let ${varName} = $$v.${varName};`).join('\n');
 
-    return new Function('$$m', '$$v', varsBlock + '\n' + knownVarsBlock + '\n' + resultTransform(exprTransformed));
+    return new Function(
+        '$$m', '$$v', /*varsBlock + '\n' + knownVarsBlock + '\n' +*/
+        resultTransform(exprTransformed));
 }
 
+/**
+ * @param expr {string}
+ * @param knownVariables {string[]}
+ * @param eventArg {string}
+ * @returns {function(*, Object.<string, *>, Event): void}
+ */
 function generateFunctionForInvokeExpression(expr, knownVariables, eventArg) {
     const regExpr = /(?<p>\.\s*)?(?<t>[_\w$][_\w\d$]*)(?<m>\s*\()?/g;
     const modelDeclarations = [];
     const kvDeclarations = [];
     const exprTransformed = expr.replace(regExpr, function (match, p, t, m) {
-        if (p) {
+        if (p || !m && (t === 'true' || t === 'false')) {
             return match;
         }
 
@@ -59,10 +73,12 @@ function generateFunctionForInvokeExpression(expr, knownVariables, eventArg) {
         return `${p || ''}$$m.${t}${m || ''}`;
     });
 
-    const varsBlock = modelDeclarations.map(varName => `let ${varName} = $$m.${varName};`).join('\n');
-    const knownVarsBlock = kvDeclarations.map(varName => `let ${varName} = $$v.${varName};`).join('\n');
+    // const varsBlock = modelDeclarations.map(varName => `let ${varName} = $$m.${varName};`).join('\n');
+    // const knownVarsBlock = kvDeclarations.map(varName => `let ${varName} = $$v.${varName};`).join('\n');
 
-    return new Function('$$m', '$$v', eventArg, varsBlock + '\n' + knownVarsBlock + '\n' + exprTransformed);
+    return new Function(
+        '$$m', '$$v', eventArg,
+        /*varsBlock + '\n' + knownVarsBlock + '\n' +*/ exprTransformed);
 }
 
 const letKeyword = 'let ';
@@ -120,6 +136,28 @@ function parseForExpression(expr, scopedVariableNames) {
     };
 }
 
+/**
+ * @param expr {string} A string in format "key1: expr1; key2: expr2"
+ * @param knownVariables {string[]}
+ * @param resultTransform {function(string|null): string}
+ * @returns {Object.<string, function(*, Object.<string, *>): *>}
+ */
+function generateFunctionsForPropertyExpression(expr, knownVariables, resultTransform) {
+    const tokens = expr.split(';');
+    const result = {};
+    for (let token of tokens) {
+        const parts = token.split(':');
+        const key = parts[0].trim();
+        const value = parts.length === 1
+            ? resultTransform(null)
+            : generateFunctionForExpression(parts[1], knownVariables, resultTransform);
+
+        result[key] = value;
+    }
+
+    return result;
+}
+
 // Binding
 class BindingContext {
     /**
@@ -138,9 +176,10 @@ class BindingContext {
         /** @type {Object.<string, *>} */ this.scopedVariables = scopedVariables || {};
 
         /** @type {BindingContext[]}   */ this.children = [];
-        ///** @type {BindingContext}     */ this.parent = parent || null;
     }
 }
+
+const forDirectiveName = 'for';
 
 /**
  * @param element {Element}
@@ -148,7 +187,7 @@ class BindingContext {
  * @param currentContext {BindingContext}
  * @param parentContext {BindingContext}
  * @param scopedVariables {string[]}
- * @return {BindingContext}
+ * @ return {BindingContext}
  */
 function bindInternal(element, model, scopedVariables, currentContext, parentContext) {
     const existingBindings = findBindings(element);
@@ -163,6 +202,14 @@ function bindInternal(element, model, scopedVariables, currentContext, parentCon
         currentContext = element[$context] = currentContext || new BindingContext(element, model, {}, parentContext);
         if (parentContext) {
             parentContext.children.push(currentContext);
+        }
+
+        // TODO: Make more generic approach
+        if (bindingKeys.includes(forDirectiveName)) {
+            const expr = existingBindings[forDirectiveName];
+            const binding = new config.directives[forDirectiveName](currentContext, expr, scopedVariables);
+            currentContext.directiveBindings.push(binding);
+            return;
         }
 
         for (let bindingName of bindingKeys) {
@@ -197,20 +244,31 @@ function bindInternal(element, model, scopedVariables, currentContext, parentCon
     }
 }
 
+const directiveWeightThreshold = 10;
 /**
  * @param context {BindingContext}
  * @param scopedVariables {Object.<string, *>}
  */
 function updateInternal(context, scopedVariables) {
     context.scopedVariables = scopedVariables;
-    for (let directive of context.directiveBindings) {
-        if (!directive.execute(context)) {
+    const directives = context.directiveBindings;
+    let index = 0;
+    // Checking for if and for directives
+    for (; index < directives.length && directives[index].weight <= directiveWeightThreshold; index++) {
+        if (!directives[index].execute(context)) {
             return;
         }
     }
 
     for (let propertyBinding of context.propertyBindings) {
         propertyBinding.execute(context);
+    }
+
+    // checking for ifx and forx directives
+    for (;index < directives.length; index++) {
+        if (!directives[index].execute(context)) {
+            return;
+        }
     }
 
     for (let childContext of context.children) {
@@ -237,12 +295,40 @@ class InnerTextBinding {
     }
 }
 
+class ClassListBinding {
+    /**
+     * @param context {BindingContext}
+     * @param expr {string}
+     * @param knownVariables {string[]}
+     */
+    constructor(context, expr, knownVariables) {
+        this.classChecks = generateFunctionsForPropertyExpression(expr, knownVariables, expr => `return !!(${expr});`);
+        this.classes = Object.keys(this.classChecks);
+    }
+
+    execute(context) {
+        for(let className of this.classes) {
+            const hasClass = this.classChecks[className](context.model, context.scopedVariables);
+            if (hasClass) {
+                if (!context.element.classList.contains(className)) {
+                    context.element.classList.add(className);
+                }
+            }
+            else {
+                if (context.element.classList.contains(className)) {
+                    context.element.classList.remove(className);
+                }
+            }
+        }
+    }
+}
+
 // Directives
 /**
  * @implements {DirectiveBinding}
  */
 class IfDirective {
-    weight = 5;
+    weight = 2;
 
     /**
      * @param context {BindingContext}
@@ -257,11 +343,11 @@ class IfDirective {
 
     /**
      * @public
-     * @param context
+     * @param context {BindingContext}
      * @return {boolean}
      */
     execute(context) {
-        if (this.check(context.model, [])) {
+        if (this.check(context.model, context.scopedVariables)) {
             const next = this.anchor.nextSibling;
             if (next) {
                 this.anchor.parentElement.insertBefore(context.element, next);
@@ -285,6 +371,43 @@ class IfDirective {
 }
 
 /**
+ * @implements {DirectiveBinding}
+ */
+class IfXDirective {
+    weight = 11;
+
+    /**
+     * @param context {BindingContext}
+     * @param expr {string}
+     * @param knownVariables {string[]}
+     */
+    constructor(context, expr, knownVariables) {
+        this.check = generateFunctionForExpression(expr, knownVariables, expr => `return !!(${expr});`);
+        this.childrenHolder = document.createDocumentFragment();
+    }
+
+    /**
+     * @public
+     * @param context {BindingContext}
+     * @return {boolean}
+     */
+    execute(context) {
+        if (this.check(context.model, context.scopedVariables)) {
+            context.element.constructor.prototype.append.apply(context.element, this.childrenHolder.childNodes);
+            return true;
+        }
+        else {
+            DocumentFragment.prototype.append.apply(this.childrenHolder, context.element.childNodes);
+            return false;
+        }
+    }
+
+    dispose(context) {
+        this.childrenHolder = null;
+    }
+}
+
+/**
  * @param htmlNodes {NodeList}
  * @param identity {*}
  * @param rootContext {BindingContext}
@@ -300,7 +423,169 @@ function ForItem(htmlNodes, identity, rootContext) {
  * @implements {DirectiveBinding}
  */
 class ForDirective {
-    weight = 10;
+    weight = 1;
+    /**
+     * @param context {BindingContext}
+     * @param expr {string}
+     * @param knownVariables {string[]}
+     */
+    constructor(context, expr, knownVariables) {
+        /** @type {Comment} */ this.anchor = document.createComment('for ' + expr);
+        const element = context.element;
+        element.parentElement.insertBefore(this.anchor, element);
+
+        context.element = this.anchor;
+        element.removeAttribute(ZX.config.prefix + 'for');
+
+        this.templateElements = document.createDocumentFragment();
+        this.templateElements.appendChild(element);
+
+        this.cfg = parseForExpression(expr, knownVariables);
+        /** @type {ForItem[]} */ this.childItems = [];
+    }
+
+    /**
+     * @param context {BindingContext}
+     * @returns {boolean}
+     */
+    execute(context) {
+        /** @type {*[]} */ const collection = this.cfg.collectionGetter(context.model);
+        let changeLayout = false;
+        let index = 0;
+
+        for (; index < collection.length; index++) {
+            const modelItem = collection[index];
+            const identity = this.cfg.itemIdentityIsIndex ? index : this.cfg.itemIdentityGetter(modelItem);
+
+            // Adding new elements
+            if (index >= this.childItems.length) {
+                this.childItems[index] = this.createChildContext(context, modelItem, identity);
+                changeLayout = true;
+            }
+            else {
+                // Looking for existing element
+                // General idea is that after all moves, items that should be deleted will be moved in the end of array
+                const otherIndex = this.childItems.findIndex(x => x.identity === identity);
+                if (otherIndex >= 0) {
+                    if (otherIndex !== index) { // If current item position changed from last update
+                        const temp = this.childItems[index];
+                        this.childItems[index] = this.childItems[otherIndex];
+                        this.childItems[otherIndex] = temp;
+                    }
+
+                    changeLayout = true;
+                }
+                else if (otherIndex < 0) { // This is new item that should be added
+                    this.childItems[this.childItems.length] = this.childItems[index];
+                    this.childItems[index] = this.createChildContext(context, modelItem, identity);
+
+                    changeLayout = true;
+                }
+            }
+
+            /** @type {ForItem} */ const childItem = this.childItems[index];
+            childItem.rootContext.model = modelItem;
+            const sv =  this.buildScopedVariables(childItem, index, context);
+            updateInternal(childItem.rootContext, sv);
+        }
+
+        const elementsToRemove = [];
+        for (; index < this.childItems.length; index++) {
+            const childItem = this.childItems[index];
+            for (let node of childItem.htmlNodes) {
+                elementsToRemove.push(node);
+            }
+
+            childItem.rootContext.children.forEach(ZX.unbind);
+        }
+        if (elementsToRemove.length) {
+            const fragment = document.createDocumentFragment();
+            DocumentFragment.prototype.append.apply(fragment, elementsToRemove);
+            fragment.innerHTML = '';
+        }
+
+        this.childItems.length = collection.length;
+        if (changeLayout) { // Restructuring UI layout
+            const allElements = [];
+            for (/** @type {ForItem} */ let item of this.childItems) {
+                for (let node of item.htmlNodes) {
+                    allElements.push(node);
+                }
+            }
+
+            const fragment = document.createDocumentFragment();
+            DocumentFragment.prototype.append.apply(fragment, allElements);
+            context.element.parentElement.insertBefore(fragment, context.element);
+            //context.element.append(fragment);
+        }
+
+        return true;
+    }
+
+    dispose(context) {
+        this.childItems.forEach(item => ZX.unbind(item.rootContext));
+        this.childItems = null;
+
+        const element = this.templateElements.elements[0];
+        element.setAttribute(ZX.config.prefix + 'for', this.anchor.data.substring(4));
+
+        context.element.appendChild(this.templateElements);
+        this.templateElements = null;
+
+        this.anchor.remove();
+        this.anchor = null;
+    }
+
+    /**
+     * @private
+     * @param directiveContext {BindingContext}
+     * @param itemModel {*}
+     * @param identity {*}
+     * @returns {ForItem}
+     */
+    createChildContext(directiveContext, itemModel, identity) {
+        const nodes = this.templateElements.cloneNode(true).childNodes;
+        /** @type {HTMLDivElement} */ const wrapper = document.createElement('div');
+
+        wrapper.append(nodes[0]);
+        const rootContext = new BindingContext(null, itemModel, directiveContext.scopedVariables, null);
+
+        const item = new ForItem(wrapper.childNodes, identity, rootContext);
+        const node = wrapper.childNodes[0];
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            bindInternal(node, directiveContext.model, this.cfg.scopedVariableNames, null, rootContext);
+        }
+
+        for (let node of wrapper.childNodes) {
+            item.htmlNodes.push(node);
+        }
+
+        return item;
+    }
+
+    /**
+     * @private
+     * @param item {ForItem}
+     * @param index {number}
+     * @param directiveContext {BindingContext}
+     */
+    buildScopedVariables(item, index, directiveContext) {
+        const scopedVariables = Object.create(directiveContext.scopedVariables);
+        scopedVariables[_indexKeyword] = index;
+        scopedVariables[_itemKeyword] = item.rootContext.model;
+        if (this.cfg.itemVariable) {
+            scopedVariables[this.cfg.itemVariable] = item.rootContext.model;
+        }
+
+        return scopedVariables;
+    }
+}
+
+/**
+ * @implements {DirectiveBinding}
+ */
+class ForXDirective {
+    weight = 12;
 
     /**
      * @param context {BindingContext}
@@ -315,6 +600,10 @@ class ForDirective {
         /** @type {ForItem[]} */ this.childItems = [];
     }
 
+    /**
+     * @param context {BindingContext}
+     * @returns {boolean}
+     */
     execute(context) {
         /** @type {*[]} */ const collection = this.cfg.collectionGetter(context.model);
         let changeLayout = false;
@@ -390,6 +679,9 @@ class ForDirective {
     dispose(context) {
         this.childItems.forEach(item => ZX.unbind(item.rootContext));
         this.childItems = null;
+
+        context.element.appendChild(this.templateElements);
+        this.templateElements = null;
     }
 
     /**
@@ -468,12 +760,15 @@ class BindingConfig {
         this.componentSlotName = 'slot';
 
         this.propertyBinders = {
-            'inner-text': InnerTextBinding
+            'inner-text': InnerTextBinding,
+            'class': ClassListBinding
         };
 
         this.directives = {
             'if': IfDirective,
-            'for': ForDirective
+            'ifx': IfXDirective,
+            'for': ForDirective,
+            'forx': ForXDirective
         };
 
         this.eventBinders = {
